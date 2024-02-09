@@ -50,6 +50,7 @@ class ExportVenvsRequest(ExportRequest):
 @dataclass(frozen=True)
 class _ExportVenvForResolveRequest(EngineAwareParameter):
     resolve: str
+    # selected_interpreter: str
 
 
 class PythonResolveExportFormat(Enum):
@@ -94,6 +95,18 @@ class ExportPluginOptions:
 
             NOTE: If you are using legacy exports (not using the '--resolve' option), then
             this option has no effect. Legacy exports will not include any editable installs.
+            """
+        ),
+        advanced=True,
+    )
+
+    py_matrix = StrListOption(
+        help=softwrap(
+            """
+            Export a virtualenv for each of these python interpreters.
+
+            Any interpreter in this list can be ignored for a particular resolve
+            if that interpreter does not match the resolve's interpreter_constraints.
             """
         ),
         advanced=True,
@@ -315,6 +328,10 @@ async def export_virtualenv_for_resolve(
         )
     )
 
+    # if request.selected_interpreter not in interpreter_constraints:
+    #     return MaybeExportResult(None)
+
+    # request.selected_interpreter instead of interpreter_constraints?
     python = await Get(PythonExecutable, InterpreterConstraints, interpreter_constraints)
     py_version = await _get_full_python_version(python)
 
@@ -362,8 +379,15 @@ async def export_virtualenvs(
     if request.targets:
         raise ExportError("The `export` goal does not take target specs.")
     maybe_venvs = await MultiGet(
-        Get(MaybeExportResult, _ExportVenvForResolveRequest(resolve))
+        Get(
+            MaybeExportResult,
+            _ExportVenvForResolveRequest(
+                resolve,
+                # selected_interpreter
+            )
+        )
         for resolve in export_subsys.options.resolve
+        # for selected_interpreter in export_subsys.options.py_matrix
     )
     return ExportResults(mv.result for mv in maybe_venvs if mv.result is not None)
 
