@@ -39,7 +39,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple, PyType};
 use pyo3::{create_exception, IntoPy, PyAny, PyRef};
 use regex::Regex;
 use remote::remote_cache::RemoteCacheWarningsBehavior;
-use rule_graph::{self, DependencyKey, RuleGraph, RuleId};
+use rule_graph::{self, RuleGraph};
 use store::RemoteProvider;
 use task_executor::Executor;
 use workunit_store::{
@@ -48,15 +48,16 @@ use workunit_store::{
 };
 
 use crate::externs::fs::{possible_store_missing_digest, PyFileDigest};
-use crate::externs::process::PyProcessExecutionEnvironment;
+use crate::intrinsics;
 use crate::{
     externs, nodes, Core, ExecutionRequest, ExecutionStrategyOptions, ExecutionTermination,
-    Failure, Function, Intrinsic, Intrinsics, Key, LocalStoreOptions, Params, RemotingOptions,
-    Rule, Scheduler, Session, SessionCore, Tasks, TypeId, Types, Value,
+    Failure, Function, Key, LocalStoreOptions, Params, RemotingOptions, Rule, Scheduler, Session,
+    Tasks, TypeId, Types, Value,
 };
 
 #[pymodule]
 fn native_engine(py: Python, m: &PyModule) -> PyO3Result<()> {
+    intrinsics::register(py, m)?;
     externs::register(py, m)?;
     externs::address::register(py, m)?;
     externs::fs::register(m)?;
@@ -133,7 +134,6 @@ fn native_engine(py: Python, m: &PyModule) -> PyO3Result<()> {
 
     m.add_function(wrap_pyfunction!(session_new_run_id, m)?)?;
     m.add_function(wrap_pyfunction!(session_poll_workunits, m)?)?;
-    m.add_function(wrap_pyfunction!(session_run_interactive_process, m)?)?;
     m.add_function(wrap_pyfunction!(session_get_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(session_get_observation_histograms, m)?)?;
     m.add_function(wrap_pyfunction!(session_record_test_observation, m)?)?;
@@ -700,9 +700,7 @@ fn scheduler_create(
         .borrow_mut()
         .take()
         .ok_or_else(|| PyException::new_err("An instance of PyTypes may only be used once."))?;
-    let intrinsics = Intrinsics::new(&types);
-    let mut tasks = py_tasks.0.replace(Tasks::new());
-    tasks.intrinsics_set(&intrinsics);
+    let tasks = py_tasks.0.replace(Tasks::new());
 
     // NOTE: Enter the Tokio runtime so that libraries like Tonic (for gRPC) are able to
     // use `tokio::spawn` since Python does not setup Tokio for the main thread. This also
@@ -715,7 +713,6 @@ fn scheduler_create(
                     py_executor.0.clone(),
                     tasks,
                     types,
-                    intrinsics,
                     build_root,
                     ignore_patterns,
                     use_gitignore,
@@ -1003,43 +1000,6 @@ fn session_poll_workunits(
         log::warn!("Panic in `session_poll_workunits`: {:?}", e);
         std::panic::resume_unwind(e);
     })
-}
-
-#[pyfunction]
-fn session_run_interactive_process(
-    py: Python,
-    py_session: &PySession,
-    interactive_process: PyObject,
-    process_config_from_environment: PyProcessExecutionEnvironment,
-) -> PyO3Result<PyObject> {
-    let core = py_session.0.core();
-    let context = py_session
-        .0
-        .core()
-        .graph
-        .context(SessionCore::new(py_session.0.clone()));
-    let interactive_process: Value = interactive_process.into();
-    let process_config = Value::new(process_config_from_environment.into_py(py));
-    py.allow_threads(|| {
-        core.executor.clone().block_on(nodes::maybe_side_effecting(
-            true,
-            &Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            core.intrinsics.run(
-                &Intrinsic {
-                    id: RuleId::new("interactive_process"),
-                    product: core.types.interactive_process_result,
-                    inputs: vec![
-                        DependencyKey::new(core.types.interactive_process),
-                        DependencyKey::new(core.types.process_config_from_environment),
-                    ],
-                },
-                context,
-                vec![interactive_process, process_config],
-            ),
-        ))
-    })
-    .map(|v| v.into())
-    .map_err(|e| PyException::new_err(e.to_string()))
 }
 
 #[pyfunction]
@@ -1406,8 +1366,7 @@ fn rule_graph_rule_gets<'p>(py: Python<'p>, py_scheduler: &PyScheduler) -> PyO3R
     core.executor.enter(|| {
         let result = PyDict::new(py);
         for (rule, rule_dependencies) in core.rule_graph.rule_dependencies() {
-            let Rule::Task(task) = rule else { continue };
-
+            let task = rule.0;
             let function = &task.func;
             let mut dependencies = Vec::new();
             for (dependency_key, rule) in rule_dependencies {
@@ -1420,7 +1379,7 @@ fn rule_graph_rule_gets<'p>(py: Python<'p>, py_scheduler: &PyScheduler) -> PyO3R
                 {
                     continue;
                 }
-                let Rule::Task(task) = rule else { continue };
+                let function = &rule.0.func;
 
                 let provided_params = dependency_key
                     .provided_params
@@ -1430,7 +1389,7 @@ fn rule_graph_rule_gets<'p>(py: Python<'p>, py_scheduler: &PyScheduler) -> PyO3R
                 dependencies.push((
                     dependency_key.product.as_py_type(py),
                     provided_params,
-                    task.func.0.value.into_py(py),
+                    function.0.value.into_py(py),
                 ));
             }
             if dependencies.is_empty() {

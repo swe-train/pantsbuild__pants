@@ -6,115 +6,137 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 
-use futures::future::{BoxFuture, FutureExt, TryFutureExt};
+use futures::future::TryFutureExt;
 use process_execution::local::{
     apply_chroot, create_sandbox, prepare_workdir, setup_run_sh_script, KeepSandboxes,
 };
 use process_execution::{ManagedChild, ProcessExecutionStrategy};
-use pyo3::{PyAny, Python, ToPyObject};
+use pyo3::prelude::{pyfunction, wrap_pyfunction, PyAny, PyModule, PyResult, Python, ToPyObject};
 use stdio::TryCloneAsFile;
 use tokio::process;
 use workunit_store::{in_workunit, Level};
 
-use crate::context::Context;
-use crate::externs;
-use crate::nodes::{task_side_effected, ExecuteProcess, NodeResult};
-use crate::python::Value;
+use crate::externs::{self, PyGeneratorResponseNativeCall};
+use crate::nodes::{task_get_context, task_side_effected, ExecuteProcess};
+use crate::python::{Failure, Value};
 
-pub(crate) fn interactive_process(
-    context: Context,
-    args: Vec<Value>,
-) -> BoxFuture<'static, NodeResult<Value>> {
-    in_workunit!(
-    "interactive_process",
-    Level::Debug,
-      |_workunit| async move {
-      let types = &context.core.types;
-      let interactive_process_result = types.interactive_process_result;
+pub fn register(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(interactive_process, m)?)?;
 
-      let (py_interactive_process, py_process, process_config): (Value, Value, externs::process::PyProcessExecutionEnvironment) = Python::with_gil(|py| {
-        let py_interactive_process = (*args[0]).as_ref(py);
-        let py_process: Value = externs::getattr(py_interactive_process, "process").unwrap();
-        let process_config = (*args[1])
-          .as_ref(py)
-          .extract()
-          .unwrap();
-        (py_interactive_process.extract().unwrap(), py_process, process_config)
-      });
-      match process_config.environment.strategy {
-        ProcessExecutionStrategy::Docker(_) | ProcessExecutionStrategy::RemoteExecution(_) => {
-          // TODO: #17182 covers adding support for running processes interactively in Docker.
-          Err(
-            format!(
-              "Only local environments support running processes \
+    Ok(())
+}
+
+#[pyfunction]
+fn interactive_process(
+    interactive_process: Value,
+    process_config: Value,
+) -> PyGeneratorResponseNativeCall {
+    PyGeneratorResponseNativeCall::new(in_workunit!(
+        "interactive_process",
+        Level::Debug,
+        |_workunit| async move {
+            let context = task_get_context();
+
+            let types = &context.core.types;
+            let interactive_process_result = types.interactive_process_result;
+
+            let (py_interactive_process, py_process, process_config): (
+                Value,
+                Value,
+                externs::process::PyProcessExecutionEnvironment,
+            ) = Python::with_gil(|py| {
+                let py_interactive_process = interactive_process.as_ref().as_ref(py);
+                let py_process: Value =
+                    externs::getattr(py_interactive_process, "process").unwrap();
+                let process_config = process_config.as_ref().as_ref(py).extract().unwrap();
+                (
+                    py_interactive_process.extract().unwrap(),
+                    py_process,
+                    process_config,
+                )
+            });
+            match process_config.environment.strategy {
+                ProcessExecutionStrategy::Docker(_)
+                | ProcessExecutionStrategy::RemoteExecution(_) => {
+                    // TODO: #17182 covers adding support for running processes interactively in Docker.
+                    Err(format!(
+                        "Only local environments support running processes \
                interactively, but a {} environment was used.",
-              process_config.environment.strategy.strategy_type(),
+                        process_config.environment.strategy.strategy_type(),
+                    ))
+                }
+                _ => Ok(()),
+            }?;
+            let mut process =
+                ExecuteProcess::lift(&context.core.store(), py_process, process_config)
+                    .await?
+                    .process;
+            let (run_in_workspace, restartable, keep_sandboxes) = Python::with_gil(|py| {
+                let py_interactive_process_obj = py_interactive_process.to_object(py);
+                let py_interactive_process = py_interactive_process_obj.as_ref(py);
+                let run_in_workspace: bool =
+                    externs::getattr(py_interactive_process, "run_in_workspace").unwrap();
+                let restartable: bool =
+                    externs::getattr(py_interactive_process, "restartable").unwrap();
+                let keep_sandboxes_value: &PyAny =
+                    externs::getattr(py_interactive_process, "keep_sandboxes").unwrap();
+                let keep_sandboxes = KeepSandboxes::from_str(
+                    externs::getattr(keep_sandboxes_value, "value").unwrap(),
+                )
+                .unwrap();
+                (run_in_workspace, restartable, keep_sandboxes)
+            });
+
+            let session = context.session.clone();
+
+            let mut tempdir = create_sandbox(
+                context.core.executor.clone(),
+                &context.core.local_execution_root_dir,
+                "interactive process",
+                keep_sandboxes,
+            )?;
+            prepare_workdir(
+                tempdir.path().to_owned(),
+                &context.core.local_execution_root_dir,
+                &process,
+                process.input_digests.inputs.clone(),
+                &context.core.store(),
+                &context.core.named_caches,
+                &context.core.immutable_inputs,
+                None,
+                None,
             )
-          )
-        },
-        _ => Ok(())
-      }?;
-      let mut process = ExecuteProcess::lift(&context.core.store(), py_process, process_config).await?.process;
-      let (run_in_workspace, restartable, keep_sandboxes) = Python::with_gil(|py| {
-        let py_interactive_process_obj = py_interactive_process.to_object(py);
-        let py_interactive_process = py_interactive_process_obj.as_ref(py);
-        let run_in_workspace: bool = externs::getattr(py_interactive_process, "run_in_workspace").unwrap();
-        let restartable: bool = externs::getattr(py_interactive_process, "restartable").unwrap();
-        let keep_sandboxes_value: &PyAny = externs::getattr(py_interactive_process, "keep_sandboxes").unwrap();
-        let keep_sandboxes = KeepSandboxes::from_str(externs::getattr(keep_sandboxes_value, "value").unwrap()).unwrap();
-        (run_in_workspace, restartable, keep_sandboxes)
-      });
+            .await?;
+            apply_chroot(tempdir.path().to_str().unwrap(), &mut process);
 
-      let session = context.session.clone();
+            let p = Path::new(&process.argv[0]);
+            // TODO: Deprecate this program name calculation, and recommend `{chroot}` replacement in args
+            // instead.
+            let program_name = if !run_in_workspace && p.is_relative() {
+                let mut buf = PathBuf::new();
+                buf.push(tempdir.path());
+                buf.push(p);
+                buf
+            } else {
+                p.to_path_buf()
+            };
 
-      let mut tempdir = create_sandbox(
-        context.core.executor.clone(),
-        &context.core.local_execution_root_dir,
-        "interactive process",
-        keep_sandboxes,
-      )?;
-      prepare_workdir(
-        tempdir.path().to_owned(),
-        &context.core.local_execution_root_dir,
-        &process,
-        process.input_digests.inputs.clone(),
-        &context.core.store(),
-        &context.core.named_caches,
-        &context.core.immutable_inputs,
-        None,
-        None,
-      )
-      .await?;
-      apply_chroot(tempdir.path().to_str().unwrap(), &mut process);
+            let mut command = process::Command::new(program_name);
+            if !run_in_workspace {
+                command.current_dir(tempdir.path());
+            }
+            for arg in process.argv[1..].iter() {
+                command.arg(arg);
+            }
 
-      let p = Path::new(&process.argv[0]);
-      // TODO: Deprecate this program name calculation, and recommend `{chroot}` replacement in args
-      // instead.
-      let program_name = if !run_in_workspace && p.is_relative() {
-        let mut buf = PathBuf::new();
-        buf.push(tempdir.path());
-        buf.push(p);
-        buf
-      } else {
-        p.to_path_buf()
-      };
+            command.env_clear();
+            command.envs(&process.env);
 
-      let mut command = process::Command::new(program_name);
-      if !run_in_workspace {
-        command.current_dir(tempdir.path());
-      }
-      for arg in process.argv[1..].iter() {
-        command.arg(arg);
-      }
+            if !restartable {
+                task_side_effected()?;
+            }
 
-      command.env_clear();
-      command.envs(&process.env);
-
-      if !restartable {
-          task_side_effected()?;
-      }
-
-      let exit_status = session.clone()
+            let exit_status = session.clone()
         .with_console_ui_disabled(async move {
           // Once any UI is torn down, grab exclusive access to the console.
           let (term_stdin, term_stdout, term_stderr) =
@@ -164,32 +186,36 @@ pub(crate) fn interactive_process(
         })
         .await?;
 
-      let code = exit_status.code().unwrap_or(-1);
-      if keep_sandboxes == KeepSandboxes::Always
-        || keep_sandboxes == KeepSandboxes::OnFailure && code != 0 {
-        tempdir.keep("interactive process");
-        let do_setup_run_sh_script = |workdir_path| -> Result<(), String> {
-          setup_run_sh_script(tempdir.path(), &process.env, &process.working_directory, &process.argv, workdir_path)
-        };
-        if run_in_workspace {
-          let cwd = current_dir()
-          .map_err(|e| format!("Could not detect current working directory: {e}"))?;
-          do_setup_run_sh_script(cwd.as_path())?;
-        } else {
-          do_setup_run_sh_script(tempdir.path())?;
+            let code = exit_status.code().unwrap_or(-1);
+            if keep_sandboxes == KeepSandboxes::Always
+                || keep_sandboxes == KeepSandboxes::OnFailure && code != 0
+            {
+                tempdir.keep("interactive process");
+                let do_setup_run_sh_script = |workdir_path| -> Result<(), String> {
+                    setup_run_sh_script(
+                        tempdir.path(),
+                        &process.env,
+                        &process.working_directory,
+                        &process.argv,
+                        workdir_path,
+                    )
+                };
+                if run_in_workspace {
+                    let cwd = current_dir()
+                        .map_err(|e| format!("Could not detect current working directory: {e}"))?;
+                    do_setup_run_sh_script(cwd.as_path())?;
+                } else {
+                    do_setup_run_sh_script(tempdir.path())?;
+                }
+            }
+
+            Ok::<_, Failure>(Python::with_gil(|py| {
+                externs::unsafe_call(
+                    py,
+                    interactive_process_result,
+                    &[externs::store_i64(py, i64::from(code))],
+                )
+            }))
         }
-      }
-
-      Ok(
-          Python::with_gil(|py| {
-        externs::unsafe_call(
-          py,
-          interactive_process_result,
-          &[externs::store_i64(py, i64::from(code))],
-        )
-
-      })
-    )
-    }
-  ).boxed()
+    ))
 }

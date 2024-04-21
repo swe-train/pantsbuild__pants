@@ -21,6 +21,7 @@ from pants.engine.console import Console
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import PathGlobs, Snapshot, Workspace
 from pants.engine.goal import CurrentExecutingGoals, Goal
+from pants.engine import intrinsics
 from pants.engine.internals import (
     build_files,
     dep_rules,
@@ -276,6 +277,7 @@ class EngineInitializer:
         rules = FrozenOrderedSet(
             (
                 *collect_rules(locals()),
+                *intrinsics.rules(),
                 *build_files.rules(),
                 *fs.rules(),
                 *dep_rules.rules(),
